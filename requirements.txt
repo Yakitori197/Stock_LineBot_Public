@@ -1,0 +1,26 @@
+# LINE Bot SDK
+line-bot-sdk>=3.14.0
+
+# Web Framework
+flask>=3.0.0
+
+# 爬蟲相關
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# 環境變數
+python-dotenv>=1.0.0
+
+# HTTP
+httpx>=0.25.0
+
+# 排程（可選）
+schedule>=1.2.0
+APScheduler>=3.10.0
+
+# 生產環境
+gunicorn>=21.0.0
+
+# 開發
+pytest>=7.4.0

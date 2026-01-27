@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  # LINE Bot 主服務
+  linebot:
+    build: .
+    container_name: stock-linebot
+    ports:
+      - "5000:5000"
+    environment:
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - DEBUG=False
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  
+  # 到價提醒排程器
+  scheduler:
+    build: .
+    container_name: stock-scheduler
+    command: python src/scheduler.py --interval 60
+    environment:
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+    restart: unless-stopped
+    depends_on:
+      - linebot

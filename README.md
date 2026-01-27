@@ -2,23 +2,19 @@
 
 台股/美股即時報價 LINE 機器人 - 雙模式備援架構（yfinance + 爬蟲）
 
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
-[![LINE](https://img.shields.io/badge/LINE-Messaging%20API-00C300.svg)](https://developers.line.biz/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+---
+
+##  Features
+
+-  **Real-time Stock Quotes** - Taiwan & US stocks
+-  **Dual-mode Fallback** - yfinance + web scraper
+-  **Watchlist** - Save your favorite stocks
+-  **Price Alerts** - Get notified when price hits target
+-  **Market Index** - Taiwan weighted index
 
 ---
 
-## ✨ Features
-
-- 📊 **Real-time Stock Quotes** - Taiwan & US stocks
-- 🔄 **Dual-mode Fallback** - yfinance + web scraper
-- 📋 **Watchlist** - Save your favorite stocks
-- 🔔 **Price Alerts** - Get notified when price hits target
-- 📈 **Market Index** - Taiwan weighted index
-
----
-
-## 📱 Demo
+##  Demo
 
 ```
 You: 2330
@@ -45,13 +41,13 @@ Bot:
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/Stock_LineBot.git
-cd Stock_LineBot
+git clone https://github.com/Yakitori197/Stock_LineBot_Public.git
+cd Stock_LineBot_Public
 ```
 
 ### 2. Create virtual environment
@@ -112,7 +108,7 @@ python src/app.py
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 Stock_LineBot/
@@ -133,7 +129,7 @@ Stock_LineBot/
 
 ---
 
-## 🔄 Dual-mode Architecture
+##  Dual-mode Architecture
 
 ```
 ┌─────────────────────────────────────────┐
@@ -151,7 +147,7 @@ Stock_LineBot/
 
 ---
 
-## 🐳 Docker Deployment
+##  Docker Deployment
 
 ```bash
 docker-compose up -d
@@ -159,18 +155,27 @@ docker-compose up -d
 
 ---
 
-## 📝 License
+##  License
 
 MIT License - feel free to use this project for personal or commercial purposes.
 
 ---
 
-## 👤 Author
+##  Author
 
-**Yakitori197**
+**YoLab 工作室**
 
 - GitHub: [@Yakitori197](https://github.com/Yakitori197)
+- LINE: [@442fjdqq](https://line.me/R/ti/p/@442fjdqq)
 
 ---
 
-## ⭐ Star this repo if you find it useful!
+##  Contact
+
+有任何問題或合作需求，歡迎透過 LINE 聯繫我們！
+
+[![LINE](https://img.shields.io/badge/LINE-@442fjdqq-00C300.svg?logo=line&logoColor=white)](https://line.me/R/ti/p/@442fjdqq)
+
+---
+
+##  Star this repo if you find it useful!

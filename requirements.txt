@@ -4,7 +4,10 @@ line-bot-sdk>=3.14.0
 # Web Framework
 flask>=3.0.0
 
-# 爬蟲相關
+# 股票資料（主要資料源）
+yfinance>=0.2.36
+
+# 爬蟲相關（備援）
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0

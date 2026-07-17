@@ -1,29 +1,33 @@
+# 皆設版本上限，避免日後重裝時解析到破壞相容性的新主版本
+
 # LINE Bot SDK
-line-bot-sdk>=3.14.0
+line-bot-sdk>=3.14.0,<4
 
 # Web Framework
-flask>=3.0.0
+flask>=3.0.0,<4
 
 # 股票資料（主要資料源）
-yfinance>=0.2.36
+# 注意：yfinance 已推出 1.x 大改版，API 與 0.2.x 不相容。
+# 本專案程式是照 0.2.x 撰寫，故鎖在 0.2 家族；要升上 1.x 需另行改寫並測試。
+yfinance>=0.2.36,<0.3
 
 # 爬蟲相關（備援）
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=5.0.0
+requests>=2.31.0,<3
+beautifulsoup4>=4.12.0,<5
+lxml>=5.0.0,<7
 
 # 環境變數
-python-dotenv>=1.0.0
+python-dotenv>=1.0.0,<2
 
 # HTTP
-httpx>=0.25.0
+httpx>=0.25.0,<1
 
 # 排程（可選）
-schedule>=1.2.0
-APScheduler>=3.10.0
+schedule>=1.2.0,<2
+APScheduler>=3.10.0,<4
 
 # 生產環境
-gunicorn>=21.0.0
+gunicorn>=21.0.0,<27
 
 # 開發
-pytest>=7.4.0
+pytest>=7.4.0,<10

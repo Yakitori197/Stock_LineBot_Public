@@ -11,13 +11,19 @@ services:
       - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
       - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
       - DEBUG=False
+      - DB_PATH=/app/data/linebot.db
+    volumes:
+      # 與 scheduler 共用同一份 SQLite —— 否則排程器看不到使用者設定的提醒
+      - linebot-data:/app/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      # 基底映像 python:3.11-slim 未安裝 curl，改用內建 python 檢查，
+      # 否則 healthcheck 會永遠失敗（恆為 unhealthy）。
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health').read()"]
       interval: 30s
       timeout: 10s
       retries: 3
-  
+
   # 到價提醒排程器
   scheduler:
     build: .
@@ -26,6 +32,14 @@ services:
     environment:
       - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
       - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - DB_PATH=/app/data/linebot.db
+    volumes:
+      # 必須與 linebot 掛同一個 volume，提醒才讀得到
+      - linebot-data:/app/data
     restart: unless-stopped
     depends_on:
       - linebot
+
+volumes:
+  # 具名 volume：跨容器共用，且重啟不遺失自選股與提醒
+  linebot-data:

@@ -41,6 +41,7 @@ from linebot.v3.exceptions import InvalidSignatureError
 # 載入模組
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.stock_service import StockDataService
+from src import store
 from config.settings import Settings
 
 # ============================================
@@ -54,8 +55,10 @@ handler = WebhookHandler(settings.LINE_CHANNEL_SECRET)
 # 股票資料服務（雙模式備援）
 stock_service = StockDataService(prefer_yfinance=True)
 
-# 簡易資料庫（生產環境請改用 Redis 或 SQLite）
-user_data = {}
+# 自選股 / 到價提醒改存 SQLite（見 src/store.py）。
+# 原本用行程內字典，導致獨立的 scheduler container 讀不到、提醒永不觸發，
+# 且 gunicorn 多 worker 間狀態不一致、重啟即失憶。
+store.init_db()
 
 
 # ============================================
@@ -96,11 +99,7 @@ def handle_message(event):
     
     # 判斷是否為群組訊息
     is_group = event.source.type in ["group", "room"]
-    
-    # 初始化用戶資料
-    if user_id not in user_data:
-        user_data[user_id] = {"watchlist": [], "alerts": []}
-    
+
     # 指令路由
     if text.lower() == "/help":
         reply = get_help_message()
@@ -215,31 +214,30 @@ def get_market_info() -> str:
 
 def add_to_watchlist(user_id: str, code: str) -> str:
     """加入自選股"""
-    if code in user_data[user_id]["watchlist"]:
+    if store.in_watchlist(user_id, code):
         return f"⚠️ {code} 已在自選股清單中"
-    
+
     # 驗證股票是否存在
     stock = stock_service.get_stock(code)
     if not stock:
         return f"❌ 找不到股票：{code}"
-    
-    user_data[user_id]["watchlist"].append(code)
+
+    store.add_to_watchlist(user_id, code)
     return f"✅ 已將 {stock.name} ({code}) 加入自選股"
 
 
 def remove_from_watchlist(user_id: str, code: str) -> str:
     """移除自選股"""
-    if code not in user_data[user_id]["watchlist"]:
+    if not store.remove_from_watchlist(user_id, code):
         return f"⚠️ {code} 不在自選股清單中"
-    
-    user_data[user_id]["watchlist"].remove(code)
+
     return f"✅ 已將 {code} 從自選股移除"
 
 
 def get_watchlist(user_id: str) -> str:
     """查看自選股"""
-    watchlist = user_data[user_id]["watchlist"]
-    
+    watchlist = store.get_watchlist(user_id)
+
     if not watchlist:
         return "📋 自選股清單為空\n\n使用 /add 股票代碼 新增"
     
@@ -284,23 +282,16 @@ def set_price_alert(user_id: str, text: str) -> str:
         return f"❌ 找不到股票：{code}"
     
     # 新增提醒
-    alert = {
-        "code": code,
-        "condition": condition,
-        "price": price,
-        "name": stock.name,
-        "created": datetime.now().isoformat()
-    }
-    user_data[user_id]["alerts"].append(alert)
-    
+    store.add_alert(user_id, code, condition, price, stock.name)
+
     condition_text = "高於" if condition == ">" else "低於"
     return f"✅ 已設定提醒\n\n當 {stock.name} ({code})\n{condition_text} {price:,.2f} 時通知您\n\n目前價格：{stock.price:,.2f}"
 
 
 def get_alerts(user_id: str) -> str:
     """查看所有提醒"""
-    alerts = user_data[user_id]["alerts"]
-    
+    alerts = store.get_alerts(user_id)
+
     if not alerts:
         return "🔔 尚未設定任何到價提醒\n\n使用 /alert 股票代碼 > 價格 設定"
     
@@ -369,25 +360,29 @@ def get_help_message() -> str:
 # 到價提醒檢查（供排程器呼叫）
 # ============================================
 def check_price_alerts():
-    """檢查所有用戶的到價提醒"""
-    for user_id, data in user_data.items():
-        alerts_to_remove = []
-        
-        for i, alert in enumerate(data["alerts"]):
-            stock = stock_service.get_stock(alert["code"])
-            
-            if not stock:
-                continue
-            
-            triggered = False
-            if alert["condition"] == ">" and stock.price > alert["price"]:
-                triggered = True
-            elif alert["condition"] == "<" and stock.price < alert["price"]:
-                triggered = True
-            
-            if triggered:
-                condition_text = "突破" if alert["condition"] == ">" else "跌破"
-                msg = f"""
+    """
+    檢查所有用戶的到價提醒。
+
+    從 SQLite 讀取（而非行程內字典），因此獨立的 scheduler container
+    也能看到 webhook 寫入的提醒。
+    """
+    for user_id, alert in store.iter_alerts():
+        stock = stock_service.get_stock(alert["code"])
+
+        if not stock:
+            continue
+
+        triggered = False
+        if alert["condition"] == ">" and stock.price > alert["price"]:
+            triggered = True
+        elif alert["condition"] == "<" and stock.price < alert["price"]:
+            triggered = True
+
+        if not triggered:
+            continue
+
+        condition_text = "突破" if alert["condition"] == ">" else "跌破"
+        msg = f"""
 🔔 到價提醒觸發！
 
 {alert['name']} ({alert['code']})
@@ -396,13 +391,9 @@ def check_price_alerts():
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """.strip()
-                
-                send_push_message(user_id, msg)
-                alerts_to_remove.append(i)
-        
-        # 移除已觸發的提醒
-        for i in reversed(alerts_to_remove):
-            data["alerts"].pop(i)
+
+        send_push_message(user_id, msg)
+        store.remove_alert(alert["id"])  # 觸發後移除
 
 
 # ============================================

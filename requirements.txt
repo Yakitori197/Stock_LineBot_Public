@@ -6,21 +6,15 @@ line-bot-sdk>=3.14.0,<4
 # Web Framework
 flask>=3.0.0,<4
 
-# 股票資料（主要資料源）
-# 注意：yfinance 已推出 1.x 大改版，API 與 0.2.x 不相容。
-# 本專案程式是照 0.2.x 撰寫，故鎖在 0.2 家族；要升上 1.x 需另行改寫並測試。
-yfinance>=0.2.36,<0.3
-
-# 爬蟲相關（備援）
-requests>=2.31.0,<3
-beautifulsoup4>=4.12.0,<5
-lxml>=5.0.0,<7
+# 行情資料
+# 統一由 yolab-quote 提供：台股代碼正規化（含 00631L 這類槓桿／反向 ETF）、
+# yfinance 與 Yahoo 兩個資料源自動備援、批次併發查詢、中文名稱對照。
+# [yfinance] extra 會帶入 yfinance 並鎖在 0.2 家族——1.x 是不相容的大改版。
+# 原本的 requests / beautifulsoup4 / lxml 是給自建爬蟲用的，該段程式已移除。
+yolab-quote[yfinance] @ git+https://github.com/Yakitori197/yolab-quote.git@main
 
 # 環境變數
 python-dotenv>=1.0.0,<2
-
-# HTTP
-httpx>=0.25.0,<1
 
 # 排程（可選）
 schedule>=1.2.0,<2

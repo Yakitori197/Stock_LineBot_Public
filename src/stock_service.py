@@ -1,47 +1,40 @@
-"""
-股票資料模組 - 雙模式備援架構
-===============================
+r"""
+股票資料服務
 
-優先使用 yfinance，失敗時自動切換到爬蟲備援
+行情抓取已改由 yolab-quote 提供，本檔只保留 LINE bot 需要的展示層
+（StockInfo.format_message 等）與既有的公開介面，呼叫端不需修改。
 
-架構：
-┌─────────────────────────────────────┐
-│           get_stock()               │
-│    ┌──────────┴──────────┐          │
-│    ▼                     ▼          │
-│ [yfinance]  ──失敗──>  [爬蟲備援]    │
-└─────────────────────────────────────┘
-
-Author: Yakitori197
-GitHub: https://github.com/Yakitori197
+改用套件後一併修正的問題：
+  * `_detect_market` 原本用 `code.isdigit()` 判斷台股，對槓桿／反向 ETF
+    （00631L、00632R）會失敗而誤判為美股。套件用 `^\d{4,6}[A-Z]{0,2}$`。
+  * `get_multiple_stocks` 原本逐檔查詢並 `time.sleep(0.5)`，改為執行緒池併發。
+  * 查詢失敗原本一律回 None，無法區分「查無此股」與「網路異常」；
+    套件會拋出帶原因的例外，這裡轉回 None 以維持既有介面，但會寫進 log。
+  * 新增中文名稱顯示（本版原本沒有對照表）。
 """
 
-import requests
-from bs4 import BeautifulSoup
-from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Literal
-from datetime import datetime
-from enum import Enum
 import logging
-import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Dict, List, Optional
 
-# 設定 logging
-logging.basicConfig(level=logging.INFO)
+import yolab_quote as yq
+from yolab_quote import QuoteClient
+
 logger = logging.getLogger(__name__)
 
-# 嘗試導入 yfinance
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-    logger.info("✅ yfinance 可用")
-except ImportError:
-    YFINANCE_AVAILABLE = False
-    logger.warning("⚠️ yfinance 未安裝，將只使用爬蟲模式")
+#: 台股大盤指數
+TW_INDEX_SYMBOL = "^TWII"
 
+#: 報價快取秒數；LINE 指令常在短時間內重複查詢同一檔。
+CACHE_TTL_SECONDS = 30
 
-# ============================================
-# 資料結構
-# ============================================
+#: 批次查詢的併發數。
+BATCH_WORKERS = 8
+
+TW_TIMEZONE = timezone(timedelta(hours=8))
+
 class Market(Enum):
     """市場類型"""
     TW = "tw"      # 台股
@@ -161,618 +154,168 @@ class StockInfo:
 # ============================================
 # yfinance 資料提供者
 # ============================================
-class YFinanceProvider:
-    """yfinance 資料提供者"""
-    
-    def __init__(self):
-        if not YFINANCE_AVAILABLE:
-            raise ImportError("yfinance is not installed")
-    
-    def get_stock(self, code: str, market: Market = Market.UNKNOWN) -> Optional[StockInfo]:
-        """
-        使用 yfinance 取得股票資料
-        
-        Args:
-            code: 股票代碼
-            market: 市場類型
-        
-        Returns:
-            StockInfo 或 None
-        """
-        try:
-            # 判斷完整代碼
-            symbol = self._get_symbol(code, market)
-            
-            logger.info(f"[yfinance] 查詢 {symbol}...")
-            
-            ticker = yf.Ticker(symbol)
-            info = ticker.info
-            
-            # 檢查是否有有效資料
-            price = info.get('regularMarketPrice') or info.get('currentPrice')
-            if not price:
-                logger.warning(f"[yfinance] {symbol} 無價格資料")
-                return None
-            
-            # 計算漲跌
-            prev_close = info.get('previousClose', 0) or info.get('regularMarketPreviousClose', 0)
-            change = price - prev_close if prev_close else 0
-            change_percent = (change / prev_close * 100) if prev_close else 0
-            
-            # 判斷市場
-            actual_market = "tw" if symbol.endswith(".TW") or symbol.endswith(".TWO") else "us"
-            
-            return StockInfo(
-                code=code.upper(),
-                name=info.get('longName') or info.get('shortName') or code,
-                price=float(price),
-                change=round(change, 2),
-                change_percent=round(change_percent, 2),
-                volume=info.get('volume', 0) or 0,
-                open_price=info.get('open') or info.get('regularMarketOpen'),
-                high_price=info.get('dayHigh') or info.get('regularMarketDayHigh'),
-                low_price=info.get('dayLow') or info.get('regularMarketDayLow'),
-                prev_close=prev_close,
-                pe_ratio=info.get('trailingPE') or info.get('forwardPE'),
-                market_cap=info.get('marketCap'),
-                market=actual_market,
-                source="yfinance",
-                update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            
-        except Exception as e:
-            logger.error(f"[yfinance] 錯誤: {e}")
-            return None
-    
-    def _get_symbol(self, code: str, market: Market) -> str:
-        """轉換為 yfinance 格式的代碼"""
-        code = code.upper().strip()
-        
-        # 已經是完整格式
-        if code.endswith(".TW") or code.endswith(".TWO"):
-            return code
-        
-        # 判斷市場
-        if market == Market.TW:
-            return f"{code}.TW"
-        elif market == Market.US:
-            return code
-        else:
-            # 自動判斷：純數字是台股，純英文是美股
-            if code.isdigit():
-                return f"{code}.TW"
-            else:
-                return code
-    
-    def get_market_index(self) -> Optional[Dict]:
-        """取得大盤指數"""
-        try:
-            ticker = yf.Ticker("^TWII")  # 台灣加權指數
-            info = ticker.info
-            
-            price = info.get('regularMarketPrice', 0)
-            prev_close = info.get('previousClose', 0)
-            change = price - prev_close if prev_close else 0
-            change_percent = (change / prev_close * 100) if prev_close else 0
-            
-            return {
-                "name": "加權指數",
-                "price": price,
-                "change": round(change, 2),
-                "change_percent": round(change_percent, 2),
-                "source": "yfinance",
-                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-        except Exception as e:
-            logger.error(f"[yfinance] 大盤錯誤: {e}")
-            return None
+
+# --------------------------------------------------------------------------- #
+# yolab-quote -> StockInfo
+# --------------------------------------------------------------------------- #
+def _to_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
-# ============================================
-# 爬蟲資料提供者（備援）
-# ============================================
-class ScraperProvider:
-    """爬蟲資料提供者（備援方案）"""
-    
-    HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-    
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(self.HEADERS)
-    
-    def get_stock(self, code: str, market: Market = Market.UNKNOWN) -> Optional[StockInfo]:
-        """
-        使用爬蟲取得股票資料
-        
-        Args:
-            code: 股票代碼
-            market: 市場類型
-        
-        Returns:
-            StockInfo 或 None
-        """
-        code = code.upper().strip()
-        
-        # 判斷市場
-        if market == Market.UNKNOWN:
-            market = Market.TW if code.isdigit() else Market.US
-        
-        if market == Market.TW:
-            return self._get_tw_stock(code)
-        else:
-            return self._get_us_stock(code)
-    
-    def _get_tw_stock(self, code: str) -> Optional[StockInfo]:
-        """爬取台股資料"""
-        url = f"https://tw.stock.yahoo.com/quote/{code}.TW"
-        
-        try:
-            logger.info(f"[Scraper] 爬取台股 {code}...")
-            response = self.session.get(url, timeout=15)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            # 解析股票名稱 - 從 title 或特定元素取得
-            name = code
-            
-            # 方法1: 從 <title> 標籤取得
-            title_tag = soup.find("title")
-            if title_tag:
-                title_text = title_tag.text.strip()
-                # 格式通常是 "台積電 (2330.TW) ..." 或 "台積電(2330.TW)..."
-                if "(" in title_text:
-                    name = title_text.split("(")[0].strip()
-            
-            # 方法2: 如果方法1失敗，嘗試從 h1 取得
-            if name == code or "Yahoo" in name:
-                h1_tag = soup.select_one("h1")
-                if h1_tag:
-                    h1_text = h1_tag.text.strip()
-                    if "(" in h1_text:
-                        name = h1_text.split("(")[0].strip()
-                    elif h1_text and "Yahoo" not in h1_text:
-                        name = h1_text
-            
-            # 解析價格
-            price = self._extract_price(soup)
-            if not price:
-                return None
-            
-            # 解析漲跌
-            change, change_percent = self._extract_change(soup)
-            
-            # 解析成交量 - 改進版
-            volume = self._extract_volume_tw(soup)
-            
-            return StockInfo(
-                code=code,
-                name=name,
-                price=price,
-                change=change,
-                change_percent=change_percent,
-                volume=volume,
-                market="tw",
-                source="scraper",
-                update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            
-        except Exception as e:
-            logger.error(f"[Scraper] 台股錯誤: {e}")
-            return None
-    
-    def _extract_volume_tw(self, soup: BeautifulSoup) -> int:
-        """提取台股成交量"""
-        import re
-        
-        # 方法1: 找所有文字，搜尋「成交」相關
-        text = soup.get_text()
-        
-        # 嘗試匹配 "成交量 53,450" 或 "成交 53,450" 的模式
-        patterns = [
-            r'成交[量張]?\s*[：:]\s*([\d,]+)',
-            r'成交[量張]?\s*([\d,]+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    vol_str = match.group(1).replace(",", "")
-                    return int(vol_str)
-                except ValueError:
-                    continue
-        
-        # 方法2: 尋找特定元素
-        volume_labels = ["成交量", "成交張數", "成交"]
-        for label in volume_labels:
-            elements = soup.find_all(string=re.compile(label))
-            for elem in elements:
-                parent = elem.find_parent()
-                if parent:
-                    # 找同層或下一個元素的數字
-                    next_elem = parent.find_next_sibling() or parent.find_next()
-                    if next_elem:
-                        try:
-                            vol_text = next_elem.get_text().strip().replace(",", "")
-                            # 只取數字部分
-                            vol_num = re.search(r'[\d,]+', vol_text)
-                            if vol_num:
-                                return int(vol_num.group().replace(",", ""))
-                        except (ValueError, AttributeError):
-                            continue
-        
-        return 0
-    
-    def _get_us_stock(self, code: str) -> Optional[StockInfo]:
-        """爬取美股資料"""
-        url = f"https://finance.yahoo.com/quote/{code}"
-        
-        try:
-            logger.info(f"[Scraper] 爬取美股 {code}...")
-            response = self.session.get(url, timeout=15)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            # 解析名稱 - 從 title 取得
-            name = code
-            
-            # 方法1: 從 <title> 標籤取得
-            title_tag = soup.find("title")
-            if title_tag:
-                title_text = title_tag.text.strip()
-                # 格式通常是 "Apple Inc. (AAPL) Stock Price..." 
-                if "(" in title_text:
-                    name = title_text.split("(")[0].strip()
-            
-            # 方法2: 從 h1 取得
-            if name == code or "Yahoo" in name:
-                h1_tag = soup.select_one("h1")
-                if h1_tag:
-                    h1_text = h1_tag.text.strip()
-                    # h1 格式可能是 "Apple Inc. (AAPL)"
-                    if "(" in h1_text:
-                        name = h1_text.split("(")[0].strip()
-                    elif h1_text and "Yahoo" not in h1_text:
-                        name = h1_text
-            
-            # 解析價格 - 嘗試多種選擇器
-            price = None
-            price_selectors = [
-                "[data-testid='qsp-price']",
-                "fin-streamer[data-field='regularMarketPrice']",
-                "span.Fw\\(b\\)",
-            ]
-            for selector in price_selectors:
-                elem = soup.select_one(selector)
-                if elem:
-                    try:
-                        price = float(elem.text.replace(",", ""))
-                        break
-                    except ValueError:
-                        continue
-            
-            if not price:
-                return None
-            
-            # 解析漲跌
-            change = 0.0
-            change_percent = 0.0
-            
-            change_elem = soup.select_one("[data-testid='qsp-price-change']")
-            if change_elem:
-                try:
-                    change = float(change_elem.text.replace(",", "").replace("+", ""))
-                except ValueError:
-                    pass
-            
-            pct_elem = soup.select_one("[data-testid='qsp-price-change-percent']")
-            if pct_elem:
-                try:
-                    pct_text = pct_elem.text.replace("%", "").replace("(", "").replace(")", "").replace("+", "")
-                    change_percent = float(pct_text)
-                except ValueError:
-                    pass
-            
-            # 如果 change 是 0 但 change_percent 不是，反算
-            if change == 0 and change_percent != 0:
-                change = price * change_percent / 100
-            
-            # 解析成交量
-            volume = self._extract_volume_us(soup)
-            
-            return StockInfo(
-                code=code,
-                name=name,
-                price=price,
-                change=change,
-                change_percent=change_percent,
-                volume=volume,
-                market="us",
-                source="scraper",
-                update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            
-        except Exception as e:
-            logger.error(f"[Scraper] 美股錯誤: {e}")
-            return None
-    
-    def _extract_volume_us(self, soup: BeautifulSoup) -> int:
-        """提取美股成交量"""
-        import re
-        
-        # 方法1: 找 Volume 相關文字
-        text = soup.get_text()
-        
-        # 匹配 "Volume 123,456,789" 或 "Vol 123M"
-        patterns = [
-            r'Volume[:\s]*([\d,]+)',
-            r'Vol[:\s]*([\d,]+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                try:
-                    vol_str = match.group(1).replace(",", "")
-                    return int(vol_str)
-                except ValueError:
-                    continue
-        
-        # 方法2: 找 data-field="regularMarketVolume" 的元素
-        vol_elem = soup.select_one("fin-streamer[data-field='regularMarketVolume']")
-        if vol_elem:
-            try:
-                vol_text = vol_elem.get_text().strip().replace(",", "")
-                return int(vol_text)
-            except ValueError:
-                pass
-        
-        return 0
-    
-    def get_market_index(self) -> Optional[Dict]:
-        """爬取大盤指數"""
-        url = "https://tw.stock.yahoo.com/quote/%5ETWII"
-        
-        try:
-            response = self.session.get(url, timeout=15)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            price = self._extract_price(soup)
-            change, change_percent = self._extract_change(soup)
-            
-            return {
-                "name": "加權指數",
-                "price": price or 0,
-                "change": change,
-                "change_percent": change_percent,
-                "source": "scraper",
-                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-        except Exception as e:
-            logger.error(f"[Scraper] 大盤錯誤: {e}")
-            return None
-    
-    # === 輔助方法 ===
-    
-    def _extract_text(self, soup: BeautifulSoup, selector: str) -> Optional[str]:
-        """提取文字"""
-        elem = soup.select_one(selector)
-        return elem.text.strip() if elem else None
-    
-    def _extract_price(self, soup: BeautifulSoup) -> Optional[float]:
-        """提取價格"""
-        # 嘗試多種選擇器
-        selectors = [
-            "span.Fz\\(32px\\)",
-            "span[class*='Fz(32']",
-            "fin-streamer[data-field='regularMarketPrice']",
-        ]
-        
-        for selector in selectors:
-            elem = soup.select_one(selector)
-            if elem:
-                try:
-                    return float(elem.text.strip().replace(",", ""))
-                except ValueError:
-                    continue
-        
+def _optional_int(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return None
-    
-    def _extract_change(self, soup: BeautifulSoup) -> tuple:
-        """提取漲跌幅"""
-        change = 0.0
-        change_percent = 0.0
-        
-        # 尋找所有可能包含漲跌的元素
-        spans = soup.find_all("span")
-        
-        for span in spans:
-            text = span.text.strip()
-            
-            # 匹配 +50.00 或 -50.00
-            if text and text[0] in ['+', '-'] and text[1:].replace('.', '').replace(',', '').isdigit():
-                try:
-                    val = float(text.replace(",", ""))
-                    if abs(val) < 1000:  # 可能是漲跌點數
-                        change = val
-                except ValueError:
-                    pass
-            
-            # 匹配百分比
-            if "%" in text:
-                try:
-                    pct = text.replace("%", "").replace("+", "").replace("(", "").replace(")", "").replace(",", "")
-                    if pct.replace("-", "").replace(".", "").isdigit():
-                        change_percent = float(pct)
-                except ValueError:
-                    pass
-        
-        return change, change_percent
-    
-    def _extract_number(self, soup: BeautifulSoup, label: str) -> int:
-        """提取標籤對應的數字"""
-        import re
-        
-        elem = soup.find(string=re.compile(f"^{label}"))
-        if elem:
-            parent = elem.find_parent()
-            if parent:
-                sibling = parent.find_next_sibling()
-                if sibling:
-                    try:
-                        return int(sibling.text.strip().replace(",", ""))
-                    except ValueError:
-                        pass
-        return 0
 
 
-# ============================================
-# 主要介面：雙模式備援
-# ============================================
+def _quote_to_stock_info(code: str, quote) -> StockInfo:
+    """把套件的 Quote 轉成既有的 StockInfo。
+
+    `code` 用呼叫端原本傳入的代碼而不是正規化後的 symbol，
+    這樣訊息裡顯示的還是使用者輸入的「2330」而非「2330.TW」。
+    """
+    market = "tw" if quote.market == yq.TW_STOCK else "us"
+    # 套件內建中文名對照；查不到才退回資料源給的名稱。
+    name = yq.get_name(quote.symbol) or quote.name or code
+
+    return StockInfo(
+        code=code,
+        name=name,
+        price=quote.price or 0.0,
+        change=quote.change or 0.0,
+        change_percent=quote.change_percent or 0.0,
+        volume=_to_int(quote.volume),
+        open_price=quote.open,
+        high_price=quote.high,
+        low_price=quote.low,
+        prev_close=quote.previous_close,
+        pe_ratio=quote.extra.get("pe_ratio"),
+        market_cap=_optional_int(quote.extra.get("market_cap")),
+        market=market,
+        source=quote.source,
+        update_time=quote.updated_at.astimezone(TW_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 class StockDataService:
-    """
-    股票資料服務 - 雙模式備援架構
-    
-    使用方式：
+    """股票資料服務。
+
+    使用方式不變：
         service = StockDataService()
-        stock = service.get_stock("2330")  # 自動判斷台股
-        stock = service.get_stock("AAPL")  # 自動判斷美股
+        stock = service.get_stock("2330")   # 自動判斷台股
+        stock = service.get_stock("AAPL")   # 自動判斷美股
     """
-    
+
     def __init__(self, prefer_yfinance: bool = True):
         """
-        初始化服務
-        
         Args:
-            prefer_yfinance: 是否優先使用 yfinance（預設 True）
+            prefer_yfinance: True 時以 yfinance 為主、Yahoo 為備援；
+                False 則反過來。兩者皆失敗才算失敗。
         """
-        self.prefer_yfinance = prefer_yfinance and YFINANCE_AVAILABLE
-        
-        # 初始化提供者
-        self.yfinance_provider = YFinanceProvider() if YFINANCE_AVAILABLE else None
-        self.scraper_provider = ScraperProvider()
-        
-        # 統計
+        order = ["yfinance", "yahoo"] if prefer_yfinance else ["yahoo", "yfinance"]
+        self.prefer_yfinance = prefer_yfinance
+        self._client = QuoteClient(
+            priority={yq.TW_STOCK: order, yq.US_STOCK: order},
+            ttl=CACHE_TTL_SECONDS,
+            max_workers=BATCH_WORKERS,
+        )
         self.stats = {
-            "yfinance_success": 0,
-            "yfinance_fail": 0,
-            "scraper_success": 0,
-            "scraper_fail": 0,
+            "success": 0,
+            "fail": 0,
         }
-        
-        logger.info(f"StockDataService 初始化完成")
-        logger.info(f"  - yfinance: {'✅ 可用' if YFINANCE_AVAILABLE else '❌ 不可用'}")
-        logger.info(f"  - 優先模式: {'yfinance' if self.prefer_yfinance else 'scraper'}")
-    
+        logger.info("StockDataService 初始化完成（yolab-quote %s）", yq.__version__)
+
+    # -- 公開介面（維持原簽名） ------------------------------------------- #
     def get_stock(self, code: str, market: Market = Market.UNKNOWN) -> Optional[StockInfo]:
-        """
-        取得股票資料（自動備援）
-        
-        Args:
-            code: 股票代碼（如 2330, AAPL）
-            market: 市場類型（可選，會自動判斷）
-        
-        Returns:
-            StockInfo 或 None
-        """
+        """取得單檔股票資料，失敗回 None。"""
         code = code.strip().upper()
-        
-        # 自動判斷市場
-        if market == Market.UNKNOWN:
-            market = self._detect_market(code)
-        
-        # 優先使用 yfinance
-        if self.prefer_yfinance and self.yfinance_provider:
-            result = self.yfinance_provider.get_stock(code, market)
-            if result:
-                self.stats["yfinance_success"] += 1
-                logger.info(f"[Service] ✅ yfinance 成功取得 {code}")
-                return result
-            else:
-                self.stats["yfinance_fail"] += 1
-                logger.warning(f"[Service] ⚠️ yfinance 失敗，切換到爬蟲備援")
-        
-        # 備援：使用爬蟲
-        result = self.scraper_provider.get_stock(code, market)
-        if result:
-            self.stats["scraper_success"] += 1
-            logger.info(f"[Service] ✅ 爬蟲成功取得 {code}")
-            return result
-        else:
-            self.stats["scraper_fail"] += 1
-            logger.error(f"[Service] ❌ 所有方法都失敗 {code}")
+        try:
+            quote = self._client.get_quote(code, self._market_arg(market))
+        except yq.QuoteError as exc:
+            self.stats["fail"] += 1
+            # 例外帶著每個資料源各自的失敗原因，比原本的靜默 None 好查。
+            logger.warning("[Service] 取得 %s 失敗: %s", code, exc)
             return None
-    
-    def get_market_index(self) -> Optional[Dict]:
-        """取得大盤指數（自動備援）"""
-        # 優先使用 yfinance
-        if self.prefer_yfinance and self.yfinance_provider:
-            result = self.yfinance_provider.get_market_index()
-            if result:
-                return result
-        
-        # 備援：使用爬蟲
-        return self.scraper_provider.get_market_index()
-    
+        self.stats["success"] += 1
+        logger.info("[Service] %s 由 %s 取得", code, quote.source)
+        return _quote_to_stock_info(code, quote)
+
     def get_multiple_stocks(self, codes: List[str]) -> List[StockInfo]:
-        """
-        批次取得多支股票
-        
-        Args:
-            codes: 股票代碼列表
-        
-        Returns:
-            StockInfo 列表
-        """
-        results = []
-        for code in codes:
-            stock = self.get_stock(code)
-            if stock:
-                results.append(stock)
-            time.sleep(0.5)  # 避免請求過快
-        return results
-    
+        """批次取得多檔股票（併發）。查不到的會被略過。"""
+        if not codes:
+            return []
+        cleaned = [c.strip().upper() for c in codes if c and c.strip()]
+        quotes = self._client.get_quotes(cleaned)
+        self.stats["success"] += len(quotes)
+        self.stats["fail"] += len(cleaned) - len(quotes)
+        return [_quote_to_stock_info(code, quotes[code]) for code in cleaned if code in quotes]
+
+    def get_market_index(self) -> Optional[Dict]:
+        """取得台股大盤指數。"""
+        try:
+            # 明確指定市場：指數代號以 ^ 開頭，不適用一般代碼推導規則。
+            quote = self._client.get_quote(TW_INDEX_SYMBOL, yq.TW_STOCK)
+        except yq.QuoteError as exc:
+            logger.warning("[Service] 取得大盤失敗: %s", exc)
+            return None
+        return {
+            "name": "加權指數",
+            "price": quote.price or 0.0,
+            "change": quote.change or 0.0,
+            "change_percent": quote.change_percent or 0.0,
+            "source": quote.source,
+            "update_time": quote.updated_at.astimezone(TW_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
     def get_stats(self) -> Dict:
-        """取得統計資訊"""
+        """統計資訊。`yfinance_available` 供 /health 端點使用。"""
+        health = self._client.health()
+        yfinance_health = health.get("yfinance")
         return {
             **self.stats,
-            "yfinance_available": YFINANCE_AVAILABLE,
+            "yfinance_available": bool(yfinance_health and yfinance_health.ok),
             "prefer_yfinance": self.prefer_yfinance,
+            "providers": {name: h.status for name, h in health.items()},
         }
-    
+
+    # -- 內部 -------------------------------------------------------------- #
+    @staticmethod
+    def _market_arg(market: Market) -> Optional[str]:
+        """把 Market enum 轉成套件的市場字串；UNKNOWN 交給套件自行推導。"""
+        if market == Market.TW:
+            return yq.TW_STOCK
+        if market == Market.US:
+            return yq.US_STOCK
+        return None
+
     def _detect_market(self, code: str) -> Market:
-        """自動判斷市場"""
-        code = code.upper().strip()
-        
-        # 已包含後綴
-        if code.endswith(".TW") or code.endswith(".TWO"):
+        """判斷市場。
+
+        改用套件的規則，因此 00631L / 00632R 這類帶字尾的台股 ETF
+        不會再被誤判為美股。
+        """
+        try:
+            detected = yq.detect_market(code)
+        except yq.SymbolError:
+            return Market.UNKNOWN
+        if detected == yq.TW_STOCK:
             return Market.TW
-        
-        # 純數字 = 台股
-        if code.isdigit():
-            return Market.TW
-        
-        # 純英文 = 美股
-        if code.isalpha():
+        if detected == yq.US_STOCK:
             return Market.US
-        
         return Market.UNKNOWN
 
 
-# ============================================
-# 便捷函式
-# ============================================
-
-# 全域服務實例
+# --------------------------------------------------------------------------- #
+# 模組層級便捷函式（維持原簽名）
+# --------------------------------------------------------------------------- #
 _service: Optional[StockDataService] = None
 
+
 def _get_service() -> StockDataService:
-    """取得全域服務實例"""
     global _service
     if _service is None:
         _service = StockDataService()
@@ -780,88 +323,25 @@ def _get_service() -> StockDataService:
 
 
 def get_stock(code: str) -> Optional[StockInfo]:
-    """
-    快速取得股票資料
-    
-    Args:
-        code: 股票代碼
-    
-    Returns:
-        StockInfo 或 None
-    
-    Example:
-        >>> stock = get_stock("2330")
-        >>> print(stock.price)
-    """
+    """取得股票資料（自動判斷市場）。"""
     return _get_service().get_stock(code)
 
 
 def get_tw_stock(code: str) -> Optional[StockInfo]:
-    """快速取得台股資料"""
+    """取得台股資料。"""
     return _get_service().get_stock(code, Market.TW)
 
 
 def get_us_stock(code: str) -> Optional[StockInfo]:
-    """快速取得美股資料"""
+    """取得美股資料。"""
     return _get_service().get_stock(code, Market.US)
 
 
 def get_market() -> Optional[Dict]:
-    """快速取得大盤指數"""
+    """取得大盤指數。"""
     return _get_service().get_market_index()
 
 
 def get_stocks(codes: List[str]) -> List[StockInfo]:
-    """批次取得多支股票"""
+    """批次取得多檔股票。"""
     return _get_service().get_multiple_stocks(codes)
-
-
-# ============================================
-# 測試
-# ============================================
-if __name__ == "__main__":
-    print("=" * 60)
-    print("股票資料服務 - 雙模式備援架構測試")
-    print("=" * 60)
-    
-    service = StockDataService()
-    
-    # 測試台股
-    print("\n🇹🇼 測試台股 - 台積電 (2330)")
-    print("-" * 40)
-    stock = service.get_stock("2330")
-    if stock:
-        print(stock.format_message())
-    else:
-        print("❌ 無法取得資料")
-    
-    # 測試美股
-    print("\n🇺🇸 測試美股 - Apple (AAPL)")
-    print("-" * 40)
-    stock = service.get_stock("AAPL")
-    if stock:
-        print(stock.format_message())
-    else:
-        print("❌ 無法取得資料")
-    
-    # 測試大盤
-    print("\n📊 測試大盤指數")
-    print("-" * 40)
-    market = service.get_market_index()
-    if market:
-        print(f"名稱: {market['name']}")
-        print(f"指數: {market['price']:,.2f}")
-        print(f"漲跌: {market['change']:+.2f} ({market['change_percent']:+.2f}%)")
-        print(f"來源: {market['source']}")
-    else:
-        print("❌ 無法取得資料")
-    
-    # 顯示統計
-    print("\n📈 統計資訊")
-    print("-" * 40)
-    stats = service.get_stats()
-    print(f"yfinance 可用: {stats['yfinance_available']}")
-    print(f"yfinance 成功: {stats['yfinance_success']}")
-    print(f"yfinance 失敗: {stats['yfinance_fail']}")
-    print(f"爬蟲成功: {stats['scraper_success']}")
-    print(f"爬蟲失敗: {stats['scraper_fail']}")

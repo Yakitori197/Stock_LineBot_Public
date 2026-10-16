@@ -52,20 +52,29 @@ cd Stock_LineBot_Public
 
 ### 2. Create virtual environment
 
-```bash
+需要 Python 3.11（與 Docker 映像一致）及 Git；`git --version` 應可執行，因為 yolab-quote 從固定 Git tag 安裝。
+
+Windows PowerShell：
+
+```powershell
+$env:PYTHONUTF8 = "1"
 python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
 
-# Windows
-venv\Scripts\activate
+Windows 預設編碼可能是 cp950；請在每次開新終端機時設定 `PYTHONUTF8=1`，避免 pip 讀取含中文註解的 requirements.txt 時解碼失敗。cmd 使用 `set PYTHONUTF8=1`，再執行 `venv\Scripts\activate.bat`。也可單次使用 `python -X utf8 -m pip install -r requirements.txt`；只改 `chcp 65001` 不等於啟用 Python UTF-8 模式。
 
-# Mac/Linux
+Linux / macOS：
+
+```bash
+python3 -m venv venv
 source venv/bin/activate
 ```
 
 ### 3. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 4. Configure environment variables
@@ -152,6 +161,28 @@ Stock_LineBot/
 ```bash
 docker-compose up -d
 ```
+
+---
+
+## 測試與自動驗證
+
+已安裝 requirements.txt 後，Windows PowerShell 執行：
+
+```powershell
+$env:PYTHONUTF8 = "1"
+python -m pip check
+python -m pytest tests -q
+```
+
+Linux / macOS 使用相同的 Python 指令即可。測試使用暫存 SQLite 資料庫，涵蓋自選股、到價提醒儲存及跨行程共用，不需要 LINE 憑證。
+
+[CI workflow](.github/workflows/ci.yml) 在推送 `main`、向 `main` 提出 PR 或手動執行時：
+
+- 在 Windows 與 Linux 的 Python 3.11 安裝依賴、執行 `pip check` 與既有測試，並設定 `PYTHONUTF8=1`。
+- 在 Linux 建置正式 Dockerfile，檢查映像依賴與 yolab-quote 0.1.1。
+- 以合成憑證、暫存資料庫及 `--network none` 載入 Web／scheduler 模組，用 Flask test client 檢查 `/health`，不啟動提醒迴圈或向 LINE 發送訊息。
+
+CI 不推送映像、不執行部署，也不使用正式憑證。這些檢查不代表已驗證真實 LINE Webhook、到價通知或線上行情服務。
 
 ---
 
